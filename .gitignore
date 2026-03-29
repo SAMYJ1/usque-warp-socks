@@ -1,0 +1,4 @@
+/local/*
+!/local/.gitkeep
+
+.DS_Store

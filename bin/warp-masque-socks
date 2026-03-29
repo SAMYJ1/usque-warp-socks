@@ -1,0 +1,449 @@
+#!/bin/sh
+
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+USQUE_HOME=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LOCAL_DIR=${USQUE_LOCAL_DIR:-"$USQUE_HOME/local"}
+LAUNCH_AGENTS_DIR=${USQUE_LAUNCH_AGENTS_DIR:-"$HOME/Library/LaunchAgents"}
+LOG_DIR="$LOCAL_DIR/log"
+LABEL="local.usque-warp-socks"
+PLIST_TEMPLATE="$USQUE_HOME/launchd/$LABEL.plist.template"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
+USQUE_VERSION=${USQUE_VERSION:-"1.4.2"}
+USQUE_BIND=${USQUE_BIND:-"127.0.0.1"}
+USQUE_PORT=${USQUE_PORT:-"1080"}
+USQUE_CONNECT_PORT=${USQUE_CONNECT_PORT:-"500"}
+USQUE_ENDPOINT_V4=${USQUE_ENDPOINT_V4:-"162.159.198.2"}
+USQUE_ENDPOINT_V6=${USQUE_ENDPOINT_V6:-"2606:4700:103::2"}
+USQUE_CONFIG="$LOCAL_DIR/config.json"
+USQUE_RUNTIME_CONFIG="$LOCAL_DIR/runtime-config.json"
+USQUE_BIN="$LOCAL_DIR/usque"
+CONTROL_SCRIPT="$USQUE_HOME/bin/warp-masque-socks"
+STDOUT_LOG="$LOG_DIR/stdout.log"
+STDERR_LOG="$LOG_DIR/stderr.log"
+RUN_TARGET="gui/$(id -u)"
+
+usage() {
+  cat <<'EOF'
+Usage: warp-masque-socks <command> [args]
+
+Commands:
+  setup                         Download usque if needed and prepare local dirs
+  register                      Register a fresh consumer WARP account
+  register-start                Register a fresh consumer WARP account and start SOCKS5
+  import-config <config.json>   Install an existing usque config into local state
+  export-config <path>          Export the current local config with 0600 permissions
+  start                         Start the background SOCKS5 proxy via launchd
+  stop                          Stop the background SOCKS5 proxy and unload launchd
+  restart                       Restart the background SOCKS5 proxy
+  status                        Show config, launchd, and listener state
+  trace                         Query the current proxy egress via 1.1.1.1 trace
+  logs                          Tail usque stdout/stderr logs
+  render-runtime-config <src> <dst>
+  render-plist <dst>
+  run
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$LOCAL_DIR" "$LOG_DIR" "$LAUNCH_AGENTS_DIR"
+}
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+platform_archive_name() {
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m)
+  case "$arch" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64) arch="amd64" ;;
+    *)
+      echo "unsupported architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+  case "$os" in
+    darwin|linux)
+      printf 'usque_%s_%s_%s.zip\n' "$USQUE_VERSION" "$os" "$arch"
+      ;;
+    *)
+      echo "unsupported OS: $os" >&2
+      exit 1
+      ;;
+  esac
+}
+
+download_binary() {
+  require_cmd curl
+  require_cmd unzip
+
+  archive=$(platform_archive_name)
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "$tmpdir"' INT TERM EXIT
+  url="https://github.com/Diniboy1123/usque/releases/download/v$USQUE_VERSION/$archive"
+
+  curl -fsSLo "$tmpdir/usque.zip" "$url"
+  unzip -oq "$tmpdir/usque.zip" -d "$tmpdir"
+  install -m 0755 "$tmpdir/usque" "$USQUE_BIN"
+
+  rm -rf "$tmpdir"
+  trap - INT TERM EXIT
+}
+
+render_runtime_config() {
+  src=$1
+  dst=$2
+
+  require_cmd jq
+  ensure_dirs
+
+  jq \
+    --arg endpoint_v4 "$USQUE_ENDPOINT_V4" \
+    --arg endpoint_v6 "$USQUE_ENDPOINT_V6" \
+    '.endpoint_v4 = $endpoint_v4 | .endpoint_v6 = $endpoint_v6' \
+    "$src" >"$dst"
+  chmod 600 "$dst"
+}
+
+render_plist() {
+  dst=$1
+
+  ensure_dirs
+  require_cmd sed
+
+  script_path="$USQUE_HOME/bin/warp-masque-socks"
+  escaped_script=$(printf '%s' "$script_path" | sed 's/[&/\]/\\&/g')
+  escaped_stdout=$(printf '%s' "$STDOUT_LOG" | sed 's/[&/\]/\\&/g')
+  escaped_stderr=$(printf '%s' "$STDERR_LOG" | sed 's/[&/\]/\\&/g')
+  escaped_label=$(printf '%s' "$LABEL" | sed 's/[&/\]/\\&/g')
+
+  sed \
+    -e "s|__LABEL__|$escaped_label|g" \
+    -e "s|__SCRIPT__|$escaped_script|g" \
+    -e "s|__STDOUT__|$escaped_stdout|g" \
+    -e "s|__STDERR__|$escaped_stderr|g" \
+    "$PLIST_TEMPLATE" >"$dst"
+}
+
+setup() {
+  ensure_dirs
+
+  if [ ! -x "$USQUE_BIN" ]; then
+    download_binary
+  fi
+
+  if [ -f "$USQUE_CONFIG" ]; then
+    render_runtime_config "$USQUE_CONFIG" "$USQUE_RUNTIME_CONFIG"
+  fi
+}
+
+register_account() {
+  setup
+  "$USQUE_BIN" -c "$USQUE_CONFIG" register -a -n "$(hostname)-usque"
+  chmod 600 "$USQUE_CONFIG"
+  render_runtime_config "$USQUE_CONFIG" "$USQUE_RUNTIME_CONFIG"
+}
+
+register_and_start() {
+  register_account
+  start_service
+}
+
+import_config() {
+  src=${1:-}
+  if [ -z "$src" ] || [ ! -f "$src" ]; then
+    echo "usage: warp-masque-socks import-config <config.json>" >&2
+    exit 1
+  fi
+
+  setup
+  install -m 0600 "$src" "$USQUE_CONFIG"
+  render_runtime_config "$USQUE_CONFIG" "$USQUE_RUNTIME_CONFIG"
+
+  if service_loaded; then
+    echo "config imported; run 'warp-masque-socks restart' to apply it to the running service" >&2
+  fi
+}
+
+export_config() {
+  dst=${1:-}
+  if [ -z "$dst" ]; then
+    echo "usage: warp-masque-socks export-config <path>" >&2
+    exit 1
+  fi
+
+  require_config
+  install -m 0600 "$USQUE_CONFIG" "$dst"
+}
+
+require_config() {
+  if [ ! -f "$USQUE_CONFIG" ]; then
+    echo "missing config: $USQUE_CONFIG" >&2
+    echo "run 'warp-masque-socks register' or 'warp-masque-socks import-config <config.json>' first" >&2
+    exit 1
+  fi
+}
+
+require_runtime_config() {
+  if [ ! -f "$USQUE_RUNTIME_CONFIG" ]; then
+    echo "missing runtime config: $USQUE_RUNTIME_CONFIG" >&2
+    echo "run 'warp-masque-socks register' or 'warp-masque-socks import-config <config.json>' first" >&2
+    exit 1
+  fi
+}
+
+service_loaded() {
+  launchctl print "$RUN_TARGET/$LABEL" >/dev/null 2>&1
+}
+
+find_running_pids() {
+  ps -axo pid=,command= |
+    awk -v bin="$USQUE_BIN" -v cfg="$USQUE_RUNTIME_CONFIG" '
+      index($0, bin) > 0 && index($0, cfg) > 0 && index($0, " socks ") > 0 { print $1 }
+    '
+}
+
+find_supervisor_pids() {
+  ps -axo pid=,command= |
+    awk -v script="$CONTROL_SCRIPT" '
+      index($0, script " supervise") > 0 { print $1 }
+    '
+}
+
+listener_up() {
+  nc -z "$USQUE_BIND" "$USQUE_PORT" >/dev/null 2>&1
+}
+
+proxy_healthcheck() {
+  attempts=0
+  while [ "$attempts" -lt 12 ]; do
+    if listener_up &&
+      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout 2 -s https://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  return 1
+}
+
+cleanup_legacy_processes() {
+  attempts=0
+  while [ "$attempts" -lt 6 ]; do
+    pids=$(find_supervisor_pids || true)
+    for pid in $pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+
+    pids=$(find_running_pids || true)
+    for pid in $pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+
+    if [ -z "$(find_supervisor_pids || true)" ] && [ -z "$(find_running_pids || true)" ]; then
+      return 0
+    fi
+
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  pids=$(find_supervisor_pids || true)
+  for pid in $pids; do
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  done
+
+  pids=$(find_running_pids || true)
+  for pid in $pids; do
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+start_service() {
+  setup
+  require_runtime_config
+  render_plist "$PLIST_PATH"
+
+  if service_loaded && proxy_healthcheck; then
+    return 0
+  fi
+
+  stop_service >/dev/null 2>&1 || true
+  launchctl enable "$RUN_TARGET/$LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "$RUN_TARGET" "$PLIST_PATH"
+
+  if service_loaded && proxy_healthcheck; then
+    return 0
+  fi
+
+  echo "failed to start usque background proxy" >&2
+  stop_service >/dev/null 2>&1 || true
+  exit 1
+}
+
+stop_service() {
+  launchctl bootout "$RUN_TARGET" "$PLIST_PATH" >/dev/null 2>&1 ||
+    launchctl bootout "$RUN_TARGET/$LABEL" >/dev/null 2>&1 || true
+  launchctl disable "$RUN_TARGET/$LABEL" >/dev/null 2>&1 || true
+  cleanup_legacy_processes
+}
+
+restart_service() {
+  stop_service
+  start_service
+}
+
+license_status() {
+  if [ ! -f "$USQUE_CONFIG" ]; then
+    echo 'license: absent'
+    return
+  fi
+
+  if jq -e '.license? | type == "string" and length > 0' "$USQUE_CONFIG" >/dev/null 2>&1; then
+    echo 'license: present'
+  else
+    echo 'license: absent'
+  fi
+}
+
+status_service() {
+  ensure_dirs
+
+  printf 'label: %s\n' "$LABEL"
+  printf 'plist: %s\n' "$PLIST_PATH"
+  printf 'binary: %s\n' "$USQUE_BIN"
+  printf 'config_path: %s\n' "$USQUE_CONFIG"
+  printf 'runtime_config: %s\n' "$USQUE_RUNTIME_CONFIG"
+  printf 'stdout_log: %s\n' "$STDOUT_LOG"
+  printf 'stderr_log: %s\n' "$STDERR_LOG"
+
+  if [ -f "$USQUE_CONFIG" ]; then
+    echo 'config: present'
+  else
+    echo 'config: missing'
+  fi
+
+  license_status
+
+  if service_loaded; then
+    echo 'launchd: loaded'
+  else
+    echo 'launchd: unloaded'
+  fi
+
+  if listener_up; then
+    echo "listener: up ($USQUE_BIND:$USQUE_PORT)"
+  else
+    echo "listener: down ($USQUE_BIND:$USQUE_PORT)"
+  fi
+}
+
+trace_proxy() {
+  attempts=0
+  while [ "$attempts" -lt 5 ]; do
+    if listener_up; then
+      if curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 https://1.1.1.1/cdn-cgi/trace; then
+        return 0
+      fi
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  return 1
+}
+
+tail_logs() {
+  ensure_dirs
+  touch "$STDOUT_LOG" "$STDERR_LOG"
+  tail -n 50 -f "$STDOUT_LOG" "$STDERR_LOG"
+}
+
+run_proxy() {
+  setup
+  require_runtime_config
+  exec "$USQUE_BIN" \
+    -c "$USQUE_RUNTIME_CONFIG" \
+    socks \
+    -b "$USQUE_BIND" \
+    -p "$USQUE_PORT" \
+    -P "$USQUE_CONNECT_PORT" \
+    -d 1.1.1.1 \
+    -d 1.0.0.1
+}
+
+command_name=${1:-}
+
+case "$command_name" in
+  setup)
+    setup
+    ;;
+  register)
+    register_account
+    ;;
+  register-start)
+    register_and_start
+    ;;
+  import-config)
+    shift
+    import_config "${1:-}"
+    ;;
+  export-config)
+    shift
+    export_config "${1:-}"
+    ;;
+  seed-from)
+    shift
+    import_config "${1:-}"
+    ;;
+  start|enable)
+    start_service
+    ;;
+  stop|disable)
+    stop_service
+    ;;
+  restart)
+    restart_service
+    ;;
+  status)
+    status_service
+    ;;
+  trace)
+    trace_proxy
+    ;;
+  logs)
+    tail_logs
+    ;;
+  render-runtime-config)
+    if [ "$#" -ne 3 ]; then
+      echo "usage: warp-masque-socks render-runtime-config <src> <dst>" >&2
+      exit 1
+    fi
+    render_runtime_config "$2" "$3"
+    ;;
+  render-plist)
+    if [ "$#" -ne 2 ]; then
+      echo "usage: warp-masque-socks render-plist <dst>" >&2
+      exit 1
+    fi
+    render_plist "$2"
+    ;;
+  run)
+    run_proxy
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $command_name" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
