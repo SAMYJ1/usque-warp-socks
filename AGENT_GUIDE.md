@@ -2,6 +2,17 @@
 
 This document is a concise operator guide for agents that need to install and use this repository on a macOS machine.
 
+Validated first-run flow from a clean public clone:
+
+```sh
+git clone https://github.com/SAMYJ1/usque-warp-socks.git
+cd usque-warp-socks
+bin/warp-masque-socks register-start
+bin/warp-masque-socks status
+bin/warp-masque-socks trace
+bin/warp-masque-socks stop
+```
+
 ## Goal
 
 Bring up a local SOCKS5 proxy backed by Cloudflare WARP MASQUE through `usque`.
