@@ -7,7 +7,7 @@ Validated first-run flow from a clean public clone:
 ```sh
 git clone https://github.com/SAMYJ1/usque-warp-socks.git
 cd usque-warp-socks
-bin/warp-masque-socks register-start
+bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
 bin/warp-masque-socks status
 bin/warp-masque-socks trace
 bin/warp-masque-socks stop
@@ -69,6 +69,26 @@ This will:
 4. render the runtime config
 5. install and enable the user LaunchAgent
 6. start the background SOCKS5 proxy
+
+### Path A2: fresh WARP+ account with your own key
+
+Use this when you have a WARP+ key from the official `1.1.1.1` app and want end-to-end verification during bootstrap.
+
+```sh
+bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
+```
+
+You can also provide the key through `USQUE_WARP_PLUS_KEY`.
+
+This path:
+
+1. registers a fresh account
+2. binds the account to your WARP+ key
+3. re-enrolls the local `usque` config
+4. starts the proxy
+5. requires `trace` to return `warp=plus`
+
+If binding fails, or `trace` still shows `warp=on`, the command exits non-zero and stops the service.
 
 ### Path B: import an existing config
 
@@ -136,12 +156,13 @@ Treat exported config files as credentials. They contain secrets.
 
 ## WARP+ Model
 
-This repository does not bind a WARP+ key directly.
+This repository can bind a WARP+ key directly during registration.
 
 Supported model:
 
 - `register` and `register-start` create a free WARP account
-- WARP+ requires importing a config that already contains the desired `license`
+- `register --license-key ...` and `register-start --license-key ...` bind a fresh account to your WARP+ key
+- importing a config that already contains the desired `license` is still supported
 
 ## Verification Checklist
 
@@ -156,7 +177,7 @@ Healthy output should include:
 
 - `launchd: loaded`
 - `listener: up (127.0.0.1:1080)`
-- `warp=on`
+- `warp=on` for free WARP, or `warp=plus` when bootstrapped with a WARP+ key
 
 `trace` should also return an `ip=` line and a `loc=` line.
 
@@ -171,6 +192,7 @@ Symptom:
 Fix:
 
 - use `register-start`, or
+- use `register-start --license-key YOUR_WARP_PLUS_KEY`, or
 - import a config and run `start`
 
 ### Service not loaded
@@ -205,3 +227,11 @@ Check:
 - whether `listener` is up
 - whether logs show MASQUE connection failures
 - whether `local/runtime-config.json` still contains the expected endpoint override
+
+### WARP+ bootstrap fails
+
+Check:
+
+- whether the key came from the official `1.1.1.1` app
+- whether the command was run against a freshly registered account
+- whether stderr shows bind failure or post-start `trace` verification failure

@@ -1,4 +1,5 @@
 /local/*
 !/local/.gitkeep
+.worktrees/
 
 .DS_Store

@@ -6,11 +6,12 @@ For an agent-focused install and operation guide, see `AGENT_GUIDE.md`.
 
 ## Overview
 
-This tool wraps `usque` into a reusable local workflow under `~/.config/usque`.
+This tool wraps `usque` into a reusable local workflow under `.`.
 
 It provides:
 
 - one-command registration and startup for a fresh free WARP account
+- one-command registration and startup for a fresh WARP+ account with your own key
 - one-command start/stop for a background SOCKS5 proxy
 - import/export of an existing `usque` config for cross-machine reuse
 - per-user `launchd` management on macOS
@@ -37,17 +38,19 @@ Important local files:
 ## Commands
 
 ```sh
-~/.config/usque/bin/warp-masque-socks setup
-~/.config/usque/bin/warp-masque-socks register
-~/.config/usque/bin/warp-masque-socks register-start
-~/.config/usque/bin/warp-masque-socks import-config /path/to/config.json
-~/.config/usque/bin/warp-masque-socks export-config /path/to/config.json
-~/.config/usque/bin/warp-masque-socks start
-~/.config/usque/bin/warp-masque-socks stop
-~/.config/usque/bin/warp-masque-socks restart
-~/.config/usque/bin/warp-masque-socks status
-~/.config/usque/bin/warp-masque-socks trace
-~/.config/usque/bin/warp-masque-socks logs
+./bin/warp-masque-socks setup
+./bin/warp-masque-socks register
+./bin/warp-masque-socks register-start
+./bin/warp-masque-socks register --license-key YOUR_WARP_PLUS_KEY
+./bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
+./bin/warp-masque-socks import-config /path/to/config.json
+./bin/warp-masque-socks export-config /path/to/config.json
+./bin/warp-masque-socks start
+./bin/warp-masque-socks stop
+./bin/warp-masque-socks restart
+./bin/warp-masque-socks status
+./bin/warp-masque-socks trace
+./bin/warp-masque-socks logs
 ```
 
 ## First Use
@@ -57,7 +60,7 @@ Important local files:
 Use this on a new machine when you do not already have a reusable `config.json`.
 
 ```sh
-~/.config/usque/bin/warp-masque-socks register-start
+./bin/warp-masque-socks register-start
 ```
 
 What it does:
@@ -72,20 +75,43 @@ What it does:
 After that, verify:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks status
-~/.config/usque/bin/warp-masque-socks trace
+./bin/warp-masque-socks status
+./bin/warp-masque-socks trace
 ```
+
+### Option A2: create a fresh WARP+ account with your own key
+
+Use this when you have a WARP+ key from the official `1.1.1.1` app and want a brand-new local account to bind immediately.
+
+```sh
+./bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
+```
+
+You can also supply the key through `USQUE_WARP_PLUS_KEY`:
+
+```sh
+USQUE_WARP_PLUS_KEY=YOUR_WARP_PLUS_KEY ./bin/warp-masque-socks register-start
+```
+
+What it does in addition to normal registration:
+
+1. binds the freshly registered account to your WARP+ key
+2. re-enrolls the local `usque` config
+3. starts the SOCKS5 proxy
+4. requires `trace` to report `warp=plus`
+
+If the key bind fails, or startup still reports `warp=on`, the command exits non-zero and stops the service instead of silently downgrading to free WARP.
 
 ### Option B: reuse an existing account on a new machine
 
 Use this when you already have a `config.json` exported from another machine.
 
 ```sh
-~/.config/usque/bin/warp-masque-socks import-config /path/to/config.json
-~/.config/usque/bin/warp-masque-socks start
+./bin/warp-masque-socks import-config /path/to/config.json
+./bin/warp-masque-socks start
 ```
 
-This is the preferred path if you want the new machine to reuse:
+This is still the preferred path if you want the new machine to reuse:
 
 - the same existing WARP account
 - a config that already contains a WARP+ `license`
@@ -95,37 +121,37 @@ This is the preferred path if you want the new machine to reuse:
 Start the background proxy:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks start
+./bin/warp-masque-socks start
 ```
 
 Stop the background proxy:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks stop
+./bin/warp-masque-socks stop
 ```
 
 Restart after changing config:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks restart
+./bin/warp-masque-socks restart
 ```
 
 Show current state:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks status
+./bin/warp-masque-socks status
 ```
 
 Check current egress IP and region through the SOCKS5 proxy:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks trace
+./bin/warp-masque-socks trace
 ```
 
 Tail logs:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks logs
+./bin/warp-masque-socks logs
 ```
 
 ## Cross-Machine Reuse
@@ -133,14 +159,14 @@ Tail logs:
 Export the current config on the old machine:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks export-config /tmp/usque-config.json
+./bin/warp-masque-socks export-config /tmp/usque-config.json
 ```
 
 Import it on the new machine:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks import-config /tmp/usque-config.json
-~/.config/usque/bin/warp-masque-socks start
+./bin/warp-masque-socks import-config /tmp/usque-config.json
+./bin/warp-masque-socks start
 ```
 
 Notes:
@@ -151,17 +177,19 @@ Notes:
 
 ## WARP+ Support
 
-This tool does not bind a WARP+ key directly.
+This tool can bind a WARP+ key directly during registration.
 
 Current support model:
 
 - `register` and `register-start` create a fresh free WARP account
-- WARP+ is supported only by importing an existing `config.json` that already contains the desired `license`
+- `register --license-key ...` and `register-start --license-key ...` bind a fresh account to your WARP+ key
+- importing an existing WARP+ `config.json` is still supported
 
 So:
 
 - if you need free WARP, use `register-start`
-- if you need WARP+, import an existing WARP+ config, then `start`
+- if you need WARP+ on a fresh account, use `register-start --license-key ...`
+- if you need to reuse an existing WARP+ account, import its config and then `start`
 
 ## launchd Behavior
 
@@ -186,6 +214,12 @@ Behavior:
 - whether a non-empty `license` field exists
 - whether the LaunchAgent is loaded
 - whether `127.0.0.1:1080` is listening
+
+Note:
+
+- `license: present` only means the config has a non-empty `license` field
+- it does not prove the current connection is WARP+
+- use `trace` and look for `warp=plus` when you need an end-to-end WARP+ check
 
 Typical healthy output includes:
 
@@ -219,6 +253,7 @@ Meaning:
 Fix:
 
 - run `register-start`
+- or run `register-start --license-key YOUR_WARP_PLUS_KEY`
 - or `import-config /path/to/config.json` and then `start`
 
 ### `launchd: unloaded`
@@ -230,7 +265,7 @@ Meaning:
 Fix:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks start
+./bin/warp-masque-socks start
 ```
 
 ### `listener: down`
@@ -242,8 +277,8 @@ Meaning:
 Check:
 
 ```sh
-~/.config/usque/bin/warp-masque-socks logs
-~/.config/usque/bin/warp-masque-socks restart
+./bin/warp-masque-socks logs
+./bin/warp-masque-socks restart
 ```
 
 ### `trace` fails
@@ -253,6 +288,19 @@ Check:
 - whether `status` shows `listener: up`
 - whether `logs` show MASQUE connection failures
 - whether the local endpoint override is still present in `runtime-config.json`
+
+### `register-start --license-key` fails
+
+Meaning:
+
+- the WARP+ key bind was rejected, or
+- Cloudflare still reported `warp=on` after startup
+
+Check:
+
+- that the key came from the official `1.1.1.1` app
+- that the account was freshly registered before binding
+- the command stderr for whether failure happened during bind or during final `trace`
 
 ## Notes
 

@@ -16,6 +16,8 @@ USQUE_PORT=${USQUE_PORT:-"1080"}
 USQUE_CONNECT_PORT=${USQUE_CONNECT_PORT:-"500"}
 USQUE_ENDPOINT_V4=${USQUE_ENDPOINT_V4:-"162.159.198.2"}
 USQUE_ENDPOINT_V6=${USQUE_ENDPOINT_V6:-"2606:4700:103::2"}
+USQUE_CF_API_URL=${USQUE_CF_API_URL:-"https://api.cloudflareclient.com"}
+USQUE_CF_API_VERSION=${USQUE_CF_API_VERSION:-"v0a4471"}
 USQUE_CONFIG="$LOCAL_DIR/config.json"
 USQUE_RUNTIME_CONFIG="$LOCAL_DIR/runtime-config.json"
 USQUE_BIN="$LOCAL_DIR/usque"
@@ -23,6 +25,7 @@ CONTROL_SCRIPT="$USQUE_HOME/bin/warp-masque-socks"
 STDOUT_LOG="$LOG_DIR/stdout.log"
 STDERR_LOG="$LOG_DIR/stderr.log"
 RUN_TARGET="gui/$(id -u)"
+REGISTER_LICENSE_KEY=
 
 usage() {
   cat <<'EOF'
@@ -30,8 +33,9 @@ Usage: warp-masque-socks <command> [args]
 
 Commands:
   setup                         Download usque if needed and prepare local dirs
-  register                      Register a fresh consumer WARP account
-  register-start                Register a fresh consumer WARP account and start SOCKS5
+  register [--license-key KEY]  Register a fresh consumer WARP account
+  register-start [--license-key KEY]
+                                Register a fresh consumer WARP account and start SOCKS5
   import-config <config.json>   Install an existing usque config into local state
   export-config <path>          Export the current local config with 0600 permissions
   start                         Start the background SOCKS5 proxy via launchd
@@ -55,6 +59,35 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 1
   fi
+}
+
+parse_register_options() {
+  REGISTER_LICENSE_KEY=${USQUE_WARP_PLUS_KEY:-}
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --license-key)
+        if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "usage: warp-masque-socks $command_name [--license-key KEY]" >&2
+          exit 1
+        fi
+        REGISTER_LICENSE_KEY=$2
+        shift 2
+        ;;
+      --license-key=*)
+        REGISTER_LICENSE_KEY=${1#--license-key=}
+        if [ -z "$REGISTER_LICENSE_KEY" ]; then
+          echo "usage: warp-masque-socks $command_name [--license-key KEY]" >&2
+          exit 1
+        fi
+        shift
+        ;;
+      *)
+        echo "usage: warp-masque-socks $command_name [--license-key KEY]" >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 platform_archive_name() {
@@ -147,12 +180,28 @@ register_account() {
   setup
   "$USQUE_BIN" -c "$USQUE_CONFIG" register -a -n "$(hostname)-usque"
   chmod 600 "$USQUE_CONFIG"
+
+  if [ -n "$REGISTER_LICENSE_KEY" ]; then
+    bind_warp_plus_license "$REGISTER_LICENSE_KEY"
+    "$USQUE_BIN" -c "$USQUE_CONFIG" enroll
+    chmod 600 "$USQUE_CONFIG"
+  fi
+
   render_runtime_config "$USQUE_CONFIG" "$USQUE_RUNTIME_CONFIG"
 }
 
 register_and_start() {
   register_account
   start_service
+
+  if [ -n "$REGISTER_LICENSE_KEY" ]; then
+    trace_output=$(trace_proxy)
+    if ! printf '%s\n' "$trace_output" | grep -q '^warp=plus$'; then
+      echo "warp+ verification failed after startup" >&2
+      stop_service >/dev/null 2>&1 || true
+      exit 1
+    fi
+  fi
 }
 
 import_config() {
@@ -194,6 +243,43 @@ require_runtime_config() {
   if [ ! -f "$USQUE_RUNTIME_CONFIG" ]; then
     echo "missing runtime config: $USQUE_RUNTIME_CONFIG" >&2
     echo "run 'warp-masque-socks register' or 'warp-masque-socks import-config <config.json>' first" >&2
+    exit 1
+  fi
+}
+
+config_field() {
+  field=$1
+  require_cmd jq
+  jq -er "$field" "$USQUE_CONFIG"
+}
+
+bind_warp_plus_license() {
+  license_key=$1
+
+  require_cmd curl
+  require_cmd jq
+  require_config
+
+  device_id=$(config_field '.id')
+  access_token=$(config_field '.access_token')
+  payload=$(jq -cn --arg license "$license_key" '{license: $license}')
+  response=$(
+    curl -fsS \
+      -X PUT \
+      -H "Authorization: Bearer $access_token" \
+      -H 'User-Agent: WARP for Android' \
+      -H 'CF-Client-Version: a-6.35-4471' \
+      -H 'Content-Type: application/json; charset=UTF-8' \
+      -H 'Connection: Keep-Alive' \
+      -d "$payload" \
+      "$USQUE_CF_API_URL/$USQUE_CF_API_VERSION/reg/$device_id/account"
+  ) || {
+    echo "failed to bind warp+ license key" >&2
+    exit 1
+  }
+
+  if ! printf '%s' "$response" | jq -e '.warp_plus == true' >/dev/null 2>&1; then
+    echo "warp+ license key was accepted but account is not warp+" >&2
     exit 1
   fi
 }
@@ -386,9 +472,13 @@ case "$command_name" in
     setup
     ;;
   register)
+    shift
+    parse_register_options "$@"
     register_account
     ;;
   register-start)
+    shift
+    parse_register_options "$@"
     register_and_start
     ;;
   import-config)
