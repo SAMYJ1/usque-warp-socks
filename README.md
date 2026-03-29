@@ -202,6 +202,8 @@ Behavior:
 
 - `start` renders the plist, enables the label, and bootstraps it into your user GUI domain
 - `stop` boots it out and disables the label
+- the LaunchAgent runs a local supervisor that probes proxy egress through the SOCKS endpoint
+- repeated probe failures make the supervisor exit so `launchd KeepAlive` can relaunch a fresh process
 - because the label is enabled during `start`, the service persists across future logins until you run `stop`
 
 ## Status Output
@@ -288,6 +290,7 @@ Check:
 - whether `status` shows `listener: up`
 - whether `logs` show MASQUE connection failures
 - whether the local endpoint override is still present in `runtime-config.json`
+- whether the logs show repeated `proxy health check failed` messages followed by an automatic restart
 
 ### `register-start --license-key` fails
 

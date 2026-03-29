@@ -120,6 +120,10 @@ case "$url" in
       exit 7
     fi
 
+    if [ -f "$state_dir/trace-http-fail" ]; then
+      exit 28
+    fi
+
     warp_mode=on
     if [ -f "$state_dir/trace-warp-mode" ]; then
       warp_mode=$(cat "$state_dir/trace-warp-mode")
@@ -268,8 +272,8 @@ if ! grep -q '<string>local.usque-warp-socks</string>' "$PLIST_OUT"; then
   exit 1
 fi
 
-if ! grep -q '<string>run</string>' "$PLIST_OUT"; then
-  echo "plist does not invoke run command" >&2
+if ! grep -q '<string>supervise</string>' "$PLIST_OUT"; then
+  echo "plist does not invoke supervise command" >&2
   exit 1
 fi
 
@@ -842,5 +846,87 @@ fi
 
 status_output=$("$SCRIPT" status)
 printf '%s\n' "$status_output" | grep -q 'launchd: unloaded'
+
+cat >"$TEST_LOCAL_DIR/usque" <<'EOF'
+#!/bin/sh
+set -eu
+
+config=config.json
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -c)
+      config=$2
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+cmd=${1:-}
+
+case "$cmd" in
+  socks)
+    touch "${TEST_STATE_DIR:?}/usque-socks-running"
+    trap 'rm -f "${TEST_STATE_DIR:?}/usque-socks-running"; exit 0' INT TERM EXIT
+    while :; do
+      sleep 1
+    done
+    ;;
+  *)
+    ;;
+esac
+EOF
+chmod 755 "$TEST_LOCAL_DIR/usque"
+touch "$TEST_STATE_DIR/listener"
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=1 \
+USQUE_SUPERVISE_HEALTH_FAILURES=2 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  if [ -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if [ ! -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+  echo "supervise did not start the usque socks child" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+touch "$TEST_STATE_DIR/trace-http-fail"
+
+attempts=0
+while [ "$attempts" -lt 6 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive after repeated health check failures" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after repeated health check failures" >&2
+  exit 1
+fi
 
 printf 'smoke ok\n'

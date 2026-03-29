@@ -9,7 +9,7 @@
     <array>
       <string>/bin/sh</string>
       <string>__SCRIPT__</string>
-      <string>run</string>
+      <string>supervise</string>
     </array>
 
     <key>RunAtLoad</key>

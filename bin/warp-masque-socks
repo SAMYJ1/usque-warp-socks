@@ -18,6 +18,12 @@ USQUE_ENDPOINT_V4=${USQUE_ENDPOINT_V4:-"162.159.198.2"}
 USQUE_ENDPOINT_V6=${USQUE_ENDPOINT_V6:-"2606:4700:103::2"}
 USQUE_CF_API_URL=${USQUE_CF_API_URL:-"https://api.cloudflareclient.com"}
 USQUE_CF_API_VERSION=${USQUE_CF_API_VERSION:-"v0a4471"}
+USQUE_TRACE_URL=${USQUE_TRACE_URL:-"https://1.1.1.1/cdn-cgi/trace"}
+USQUE_TRACE_CONNECT_TIMEOUT=${USQUE_TRACE_CONNECT_TIMEOUT:-"2"}
+USQUE_SUPERVISE_HEALTH_INTERVAL=${USQUE_SUPERVISE_HEALTH_INTERVAL:-"30"}
+USQUE_SUPERVISE_HEALTH_TIMEOUT=${USQUE_SUPERVISE_HEALTH_TIMEOUT:-"5"}
+USQUE_SUPERVISE_HEALTH_FAILURES=${USQUE_SUPERVISE_HEALTH_FAILURES:-"3"}
+USQUE_SUPERVISE_HEALTH_GRACE=${USQUE_SUPERVISE_HEALTH_GRACE:-"15"}
 USQUE_CONFIG="$LOCAL_DIR/config.json"
 USQUE_RUNTIME_CONFIG="$LOCAL_DIR/runtime-config.json"
 USQUE_BIN="$LOCAL_DIR/usque"
@@ -44,6 +50,7 @@ Commands:
   status                        Show config, launchd, and listener state
   trace                         Query the current proxy egress via 1.1.1.1 trace
   logs                          Tail usque stdout/stderr logs
+  supervise                     Run usque under a local health-check supervisor
   render-runtime-config <src> <dst>
   render-plist <dst>
   run
@@ -310,7 +317,7 @@ proxy_healthcheck() {
   attempts=0
   while [ "$attempts" -lt 12 ]; do
     if listener_up &&
-      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout 2 -s https://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1; then
+      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_TRACE_CONNECT_TIMEOUT" -s "$USQUE_TRACE_URL" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -435,7 +442,7 @@ trace_proxy() {
   attempts=0
   while [ "$attempts" -lt 5 ]; do
     if listener_up; then
-      if curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 https://1.1.1.1/cdn-cgi/trace; then
+      if curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_TRACE_CONNECT_TIMEOUT" "$USQUE_TRACE_URL"; then
         return 0
       fi
     fi
@@ -452,9 +459,7 @@ tail_logs() {
   tail -n 50 -f "$STDOUT_LOG" "$STDERR_LOG"
 }
 
-run_proxy() {
-  setup
-  require_runtime_config
+exec_usque_socks() {
   exec "$USQUE_BIN" \
     -c "$USQUE_RUNTIME_CONFIG" \
     socks \
@@ -463,6 +468,59 @@ run_proxy() {
     -P "$USQUE_CONNECT_PORT" \
     -d 1.1.1.1 \
     -d 1.0.0.1
+}
+
+supervise_proxy() {
+  setup
+  require_runtime_config
+
+  child_pid=
+  cleanup_child() {
+    if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" >/dev/null 2>&1; then
+      kill "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" >/dev/null 2>&1 || true
+    fi
+  }
+  trap 'cleanup_child; exit 0' INT TERM HUP
+
+  "$USQUE_BIN" \
+    -c "$USQUE_RUNTIME_CONFIG" \
+    socks \
+    -b "$USQUE_BIND" \
+    -p "$USQUE_PORT" \
+    -P "$USQUE_CONNECT_PORT" \
+    -d 1.1.1.1 \
+    -d 1.0.0.1 &
+  child_pid=$!
+
+  if [ "$USQUE_SUPERVISE_HEALTH_GRACE" -gt 0 ]; then
+    sleep "$USQUE_SUPERVISE_HEALTH_GRACE"
+  fi
+
+  failures=0
+  while kill -0 "$child_pid" >/dev/null 2>&1; do
+    if listener_up &&
+      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_SUPERVISE_HEALTH_TIMEOUT" -s "$USQUE_TRACE_URL" >/dev/null 2>&1; then
+      failures=0
+    else
+      failures=$((failures + 1))
+      printf 'proxy health check failed (%s/%s)\n' "$failures" "$USQUE_SUPERVISE_HEALTH_FAILURES" >&2
+      if [ "$failures" -ge "$USQUE_SUPERVISE_HEALTH_FAILURES" ]; then
+        echo 'proxy health check failure threshold reached; exiting for launchd restart' >&2
+        cleanup_child
+        exit 1
+      fi
+    fi
+    sleep "$USQUE_SUPERVISE_HEALTH_INTERVAL"
+  done
+
+  wait "$child_pid"
+}
+
+run_proxy() {
+  setup
+  require_runtime_config
+  exec_usque_socks
 }
 
 command_name=${1:-}
@@ -510,6 +568,9 @@ case "$command_name" in
     ;;
   logs)
     tail_logs
+    ;;
+  supervise)
+    supervise_proxy
     ;;
   render-runtime-config)
     if [ "$#" -ne 3 ]; then

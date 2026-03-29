@@ -227,6 +227,7 @@ Check:
 - whether `listener` is up
 - whether logs show MASQUE connection failures
 - whether `local/runtime-config.json` still contains the expected endpoint override
+- whether logs show repeated `proxy health check failed` messages followed by a fresh `SOCKS proxy listening` line
 
 ### WARP+ bootstrap fails
 
