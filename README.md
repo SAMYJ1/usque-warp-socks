@@ -2,6 +2,8 @@
 
 Background SOCKS5 proxy backed by `usque`, using Cloudflare WARP MASQUE.
 
+For an agent-focused install and operation guide, see `AGENT_GUIDE.md`.
+
 ## Overview
 
 This tool wraps `usque` into a reusable local workflow under `~/.config/usque`.
