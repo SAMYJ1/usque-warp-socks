@@ -1,23 +1,12 @@
 # Agent Guide
 
-This document is a concise operator guide for agents that need to install and use this repository on a macOS machine.
+Concise operations guide for agents installing, validating, or repairing this repository on macOS.
 
-Validated first-run flow from a clean public clone:
-
-```sh
-git clone https://github.com/SAMYJ1/usque-warp-socks.git
-cd usque-warp-socks
-bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
-bin/warp-masque-socks status
-bin/warp-masque-socks trace
-bin/warp-masque-socks stop
-```
-
-## Goal
+## Purpose
 
 Bring up a local SOCKS5 proxy backed by Cloudflare WARP MASQUE through `usque`.
 
-Default proxy endpoint:
+Default local endpoint:
 
 ```text
 127.0.0.1:1080
@@ -27,193 +16,161 @@ Default proxy endpoint:
 
 Required commands:
 
-- `git`
 - `curl`
 - `jq`
-- `unzip`
 - `launchctl`
 - `nc`
-- `cc`
+- `python3`
+- `sed`
+- `unzip`
 
 Expected platform:
 
 - macOS
-- user session with a working `launchd` GUI domain
+- a user session with a working `launchd` GUI domain
 
-## Install
+## Validated First-Run Flow
 
-Clone the repository:
+From a clean clone:
 
 ```sh
 git clone https://github.com/SAMYJ1/usque-warp-socks.git
 cd usque-warp-socks
+bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
+bin/warp-masque-socks status
+bin/warp-masque-socks trace
 ```
 
-No package manager install step is required. The script downloads `usque` on first use.
+For free WARP, omit `--license-key`.
 
-## First-Time Setup
+## Setup Paths
 
-### Path A: fresh free WARP account
-
-Use this when there is no existing `config.json` to reuse.
+### Fresh free WARP account
 
 ```sh
 bin/warp-masque-socks register-start
 ```
 
-This will:
+This downloads `usque` if needed, registers an account, renders runtime config, installs the LaunchAgent, and starts the proxy.
 
-1. create `local/` state if missing
-2. download the `usque` binary if missing
-3. register a new free Consumer WARP account
-4. render the runtime config
-5. install and enable the user LaunchAgent
-6. start the background SOCKS5 proxy
-
-### Path A2: fresh WARP+ account with your own key
-
-Use this when you have a WARP+ key from the official `1.1.1.1` app and want end-to-end verification during bootstrap.
+### Fresh WARP+ account
 
 ```sh
 bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
 ```
 
-You can also provide the key through `USQUE_WARP_PLUS_KEY`.
+The key can also come from `USQUE_WARP_PLUS_KEY`. This path verifies that trace reports `warp=plus`; if not, it stops the service and exits non-zero.
 
-This path:
-
-1. registers a fresh account
-2. binds the account to your WARP+ key
-3. re-enrolls the local `usque` config
-4. starts the proxy
-5. requires `trace` to return `warp=plus`
-
-If binding fails, or `trace` still shows `warp=on`, the command exits non-zero and stops the service.
-
-### Path B: import an existing config
-
-Use this when reusing an existing account or a config that already contains a WARP+ `license`.
+### Existing config
 
 ```sh
 bin/warp-masque-socks import-config /path/to/config.json
 bin/warp-masque-socks start
 ```
 
+Use this when reusing an existing WARP account or an existing WARP+ config.
+
 ## Daily Operations
 
-Start the proxy:
+| Task | Command |
+| --- | --- |
+| Start proxy | `bin/warp-masque-socks start` |
+| Stop proxy | `bin/warp-masque-socks stop` |
+| Restart proxy | `bin/warp-masque-socks restart` |
+| Show state | `bin/warp-masque-socks status` |
+| Verify WARP egress | `bin/warp-masque-socks trace` |
+| Tail logs | `bin/warp-masque-socks logs` |
+| Export config | `bin/warp-masque-socks export-config /tmp/usque-config.json` |
+| Import config | `bin/warp-masque-socks import-config /path/to/config.json` |
 
-```sh
-bin/warp-masque-socks start
-```
+## Runtime Model
 
-Stop the proxy:
+The service is a per-user LaunchAgent:
 
-```sh
-bin/warp-masque-socks stop
-```
+- label: `local.usque-warp-socks`
+- plist: `~/Library/LaunchAgents/local.usque-warp-socks.plist`
+- program: `bin/warp-masque-socks supervise`
 
-Restart after a config change:
+Important local files:
 
-```sh
-bin/warp-masque-socks restart
-```
+- `local/usque`: downloaded proxy binary.
+- `local/config.json`: account config; contains secrets.
+- `local/runtime-config.json`: rendered runtime config with endpoint override.
+- `local/log/stdout.log`: stdout log.
+- `local/log/stderr.log`: stderr and supervisor log.
 
-Show runtime state:
+`start` and `restart` return when launchd is loaded and `127.0.0.1:1080` is listening. Run `trace` separately to verify end-to-end WARP egress.
 
-```sh
-bin/warp-masque-socks status
-```
+## Self-Healing Behavior
 
-Check egress IP and region through the proxy:
+The supervisor owns the `usque socks` child and restarts it when runtime state requires a fresh tunnel:
 
-```sh
-bin/warp-masque-socks trace
-```
+- repeated proxy egress probe failures
+- default route changes after network switches
+- `usque` tunnel-loss log events
+- child shutdown that hangs after `TERM`
 
-Tail logs:
+Expected recovery markers in `local/log/stderr.log` include:
 
-```sh
-bin/warp-masque-socks logs
-```
+- `proxy health check failed`
+- `proxy health check failure threshold reached; exiting for launchd restart`
+- `default network changed; exiting for launchd restart`
+- `usque tunnel connection lost; exiting for launchd restart`
+- `recent network recovery detected; starting hidden backend before public SOCKS relay`
+- `public SOCKS relay listening on 127.0.0.1:1080 -> 127.0.0.1:1081`
 
-## Cross-Machine Reuse
+Default supervisor settings favor quick recovery while leaving startup and network-recovery settling windows:
 
-Export on the source machine:
+- `USQUE_SUPERVISE_HEALTH_GRACE=10`
+- `USQUE_SUPERVISE_HEALTH_TIMEOUT=3`
+- `USQUE_SUPERVISE_HEALTH_FAILURES=2`
+- `USQUE_SUPERVISE_HEALTH_RETRY_INTERVAL=1`
+- `USQUE_SUPERVISE_NETWORK_POLL_INTERVAL=2`
+- `USQUE_SUPERVISE_RECOVERY_GRACE=20`
+- `USQUE_BACKEND_PORT=1081`
 
-```sh
-bin/warp-masque-socks export-config /tmp/usque-config.json
-```
-
-Import on the destination machine:
-
-```sh
-bin/warp-masque-socks import-config /tmp/usque-config.json
-bin/warp-masque-socks start
-```
-
-Treat exported config files as credentials. They contain secrets.
-
-## WARP+ Model
-
-This repository can bind a WARP+ key directly during registration.
-
-Supported model:
-
-- `register` and `register-start` create a free WARP account
-- `register --license-key ...` and `register-start --license-key ...` bind a fresh account to your WARP+ key
-- importing a config that already contains the desired `license` is still supported
+Network-route changes, tunnel-loss events, manual restarts, and health-check restarts write `local/supervise-recovery-until`. The next supervisor process honors that marker by starting `usque` on a hidden backend port, probing that backend through WARP, and only then opening the public SOCKS relay. This keeps Clash from flooding a half-ready WARP tunnel.
 
 ## Verification Checklist
 
-After setup, run:
+After setup or repair:
 
 ```sh
 bin/warp-masque-socks status
 bin/warp-masque-socks trace
 ```
 
-Healthy output should include:
+Healthy status includes:
 
+- `config: present`
 - `launchd: loaded`
 - `listener: up (127.0.0.1:1080)`
-- `warp=on` for free WARP, or `warp=plus` when bootstrapped with a WARP+ key
 
-`trace` should also return an `ip=` line and a `loc=` line.
+Healthy trace includes:
+
+- `ip=...`
+- `loc=...`
+- `warp=on` for free WARP or `warp=plus` for WARP+
 
 ## Troubleshooting
 
 ### Missing config
 
-Symptom:
+Run one of:
 
-- script reports `missing config`
+```sh
+bin/warp-masque-socks register-start
+bin/warp-masque-socks register-start --license-key YOUR_WARP_PLUS_KEY
+bin/warp-masque-socks import-config /path/to/config.json
+```
 
-Fix:
-
-- use `register-start`, or
-- use `register-start --license-key YOUR_WARP_PLUS_KEY`, or
-- import a config and run `start`
-
-### Service not loaded
-
-Symptom:
-
-- `status` shows `launchd: unloaded`
-
-Fix:
+### LaunchAgent not loaded
 
 ```sh
 bin/warp-masque-socks start
 ```
 
 ### Listener down
-
-Symptom:
-
-- `status` shows `listener: down`
-
-Fix:
 
 ```sh
 bin/warp-masque-socks logs
@@ -224,15 +181,28 @@ bin/warp-masque-socks restart
 
 Check:
 
-- whether `listener` is up
-- whether logs show MASQUE connection failures
-- whether `local/runtime-config.json` still contains the expected endpoint override
-- whether logs show repeated `proxy health check failed` messages followed by a fresh `SOCKS proxy listening` line
+- `status` still shows `listener: up`.
+- `local/runtime-config.json` contains the expected endpoint override.
+- `local/log/stderr.log` shows MASQUE connection attempts.
+- supervisor recovery markers appear when the tunnel or network changes.
+
+If applications such as Clash still use stale SOCKS streams, restart the service and watch for a fresh `SOCKS proxy listening` line:
+
+```sh
+bin/warp-masque-socks restart
+bin/warp-masque-socks trace
+```
 
 ### WARP+ bootstrap fails
 
 Check:
 
-- whether the key came from the official `1.1.1.1` app
-- whether the command was run against a freshly registered account
-- whether stderr shows bind failure or post-start `trace` verification failure
+- the key came from the official `1.1.1.1` app
+- the command was run against a freshly registered account
+- stderr indicates whether failure happened during key bind or final trace verification
+
+## Safety Notes
+
+- Treat `local/config.json` and exported configs as credentials.
+- Do not commit anything under `local/`.
+- `license: present` in `status` only means a non-empty license field exists; use `trace` to verify live WARP+ egress.

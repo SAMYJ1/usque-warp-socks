@@ -13,6 +13,8 @@ PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 USQUE_VERSION=${USQUE_VERSION:-"1.4.2"}
 USQUE_BIND=${USQUE_BIND:-"127.0.0.1"}
 USQUE_PORT=${USQUE_PORT:-"1080"}
+USQUE_BACKEND_BIND=${USQUE_BACKEND_BIND:-"127.0.0.1"}
+USQUE_BACKEND_PORT=${USQUE_BACKEND_PORT:-"1081"}
 USQUE_CONNECT_PORT=${USQUE_CONNECT_PORT:-"500"}
 USQUE_ENDPOINT_V4=${USQUE_ENDPOINT_V4:-"162.159.198.2"}
 USQUE_ENDPOINT_V6=${USQUE_ENDPOINT_V6:-"2606:4700:103::2"}
@@ -20,16 +22,23 @@ USQUE_CF_API_URL=${USQUE_CF_API_URL:-"https://api.cloudflareclient.com"}
 USQUE_CF_API_VERSION=${USQUE_CF_API_VERSION:-"v0a4471"}
 USQUE_TRACE_URL=${USQUE_TRACE_URL:-"https://1.1.1.1/cdn-cgi/trace"}
 USQUE_TRACE_CONNECT_TIMEOUT=${USQUE_TRACE_CONNECT_TIMEOUT:-"2"}
+USQUE_TRACE_MAX_TIME=${USQUE_TRACE_MAX_TIME:-"8"}
 USQUE_SUPERVISE_HEALTH_INTERVAL=${USQUE_SUPERVISE_HEALTH_INTERVAL:-"30"}
-USQUE_SUPERVISE_HEALTH_TIMEOUT=${USQUE_SUPERVISE_HEALTH_TIMEOUT:-"5"}
-USQUE_SUPERVISE_HEALTH_FAILURES=${USQUE_SUPERVISE_HEALTH_FAILURES:-"3"}
-USQUE_SUPERVISE_HEALTH_GRACE=${USQUE_SUPERVISE_HEALTH_GRACE:-"15"}
+USQUE_SUPERVISE_HEALTH_RETRY_INTERVAL=${USQUE_SUPERVISE_HEALTH_RETRY_INTERVAL:-"1"}
+USQUE_SUPERVISE_HEALTH_TIMEOUT=${USQUE_SUPERVISE_HEALTH_TIMEOUT:-"3"}
+USQUE_SUPERVISE_HEALTH_FAILURES=${USQUE_SUPERVISE_HEALTH_FAILURES:-"2"}
+USQUE_SUPERVISE_HEALTH_GRACE=${USQUE_SUPERVISE_HEALTH_GRACE:-"10"}
+USQUE_SUPERVISE_NETWORK_POLL_INTERVAL=${USQUE_SUPERVISE_NETWORK_POLL_INTERVAL:-"2"}
+USQUE_SUPERVISE_CHILD_STOP_TIMEOUT=${USQUE_SUPERVISE_CHILD_STOP_TIMEOUT:-"5"}
+USQUE_SUPERVISE_RECOVERY_GRACE=${USQUE_SUPERVISE_RECOVERY_GRACE:-"20"}
+PYTHON_BIN=${PYTHON_BIN:-"python3"}
 USQUE_CONFIG="$LOCAL_DIR/config.json"
 USQUE_RUNTIME_CONFIG="$LOCAL_DIR/runtime-config.json"
 USQUE_BIN="$LOCAL_DIR/usque"
 CONTROL_SCRIPT="$USQUE_HOME/bin/warp-masque-socks"
 STDOUT_LOG="$LOG_DIR/stdout.log"
 STDERR_LOG="$LOG_DIR/stderr.log"
+SUPERVISE_RECOVERY_MARKER="$LOCAL_DIR/supervise-recovery-until"
 RUN_TARGET="gui/$(id -u)"
 REGISTER_LICENSE_KEY=
 
@@ -309,15 +318,52 @@ find_supervisor_pids() {
     '
 }
 
+find_relay_pids() {
+  ps -axo pid=,command= |
+    awk -v marker="warp-masque-socks-relay" -v bind="$USQUE_BIND" -v port="$USQUE_PORT" '
+      index($0, marker) > 0 && index($0, bind) > 0 && index($0, port) > 0 && index($0, "awk") == 0 { print $1 }
+    '
+}
+
 listener_up() {
   nc -z "$USQUE_BIND" "$USQUE_PORT" >/dev/null 2>&1
+}
+
+backend_listener_up() {
+  nc -z "$USQUE_BACKEND_BIND" "$USQUE_BACKEND_PORT" >/dev/null 2>&1
+}
+
+proxy_trace_check() {
+  bind=$1
+  port=$2
+  timeout=$3
+
+  curl -k --socks5 "$bind:$port" -4 --connect-timeout "$timeout" --max-time "$timeout" -s "$USQUE_TRACE_URL" >/dev/null 2>&1
 }
 
 proxy_healthcheck() {
   attempts=0
   while [ "$attempts" -lt 12 ]; do
-    if listener_up &&
-      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_TRACE_CONNECT_TIMEOUT" -s "$USQUE_TRACE_URL" >/dev/null 2>&1; then
+    if listener_up && proxy_trace_check "$USQUE_BIND" "$USQUE_PORT" "$USQUE_TRACE_MAX_TIME"; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  return 1
+}
+
+wait_for_listener() {
+  attempts=0
+  max_attempts=12
+  recovery_grace=$(recovery_grace_remaining)
+  if [ "$recovery_grace" -gt 0 ]; then
+    max_attempts=$((max_attempts + recovery_grace))
+  fi
+
+  while [ "$attempts" -lt "$max_attempts" ]; do
+    if listener_up; then
       return 0
     fi
     sleep 1
@@ -340,7 +386,14 @@ cleanup_legacy_processes() {
       kill "$pid" >/dev/null 2>&1 || true
     done
 
-    if [ -z "$(find_supervisor_pids || true)" ] && [ -z "$(find_running_pids || true)" ]; then
+    pids=$(find_relay_pids || true)
+    for pid in $pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+
+    if [ -z "$(find_supervisor_pids || true)" ] &&
+      [ -z "$(find_running_pids || true)" ] &&
+      [ -z "$(find_relay_pids || true)" ]; then
       return 0
     fi
 
@@ -354,6 +407,11 @@ cleanup_legacy_processes() {
   done
 
   pids=$(find_running_pids || true)
+  for pid in $pids; do
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  done
+
+  pids=$(find_relay_pids || true)
   for pid in $pids; do
     kill -9 "$pid" >/dev/null 2>&1 || true
   done
@@ -372,7 +430,7 @@ start_service() {
   launchctl enable "$RUN_TARGET/$LABEL" >/dev/null 2>&1 || true
   launchctl bootstrap "$RUN_TARGET" "$PLIST_PATH"
 
-  if service_loaded && proxy_healthcheck; then
+  if service_loaded && wait_for_listener; then
     return 0
   fi
 
@@ -389,6 +447,7 @@ stop_service() {
 }
 
 restart_service() {
+  mark_recovery_grace
   stop_service
   start_service
 }
@@ -442,7 +501,7 @@ trace_proxy() {
   attempts=0
   while [ "$attempts" -lt 5 ]; do
     if listener_up; then
-      if curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_TRACE_CONNECT_TIMEOUT" "$USQUE_TRACE_URL"; then
+      if curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_TRACE_CONNECT_TIMEOUT" --max-time "$USQUE_TRACE_MAX_TIME" "$USQUE_TRACE_URL"; then
         return 0
       fi
     fi
@@ -470,51 +529,332 @@ exec_usque_socks() {
     -d 1.0.0.1
 }
 
+network_signature() {
+  if ! command -v route >/dev/null 2>&1; then
+    return 0
+  fi
+
+  route -n get default 2>/dev/null |
+    awk '
+    $1 == "gateway:" { gateway = $2 }
+    $1 == "interface:" { interface = $2 }
+    $1 == "ifscope:" { ifscope = $2 }
+    END {
+      if (gateway != "" || interface != "" || ifscope != "") {
+        printf "gateway=%s interface=%s ifscope=%s\n", gateway, interface, ifscope
+      }
+    }
+    '
+}
+
+is_uint() {
+  case "$1" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+now_epoch() {
+  date +%s
+}
+
+mark_recovery_grace() {
+  if ! is_uint "$USQUE_SUPERVISE_RECOVERY_GRACE" ||
+    [ "$USQUE_SUPERVISE_RECOVERY_GRACE" -le 0 ]; then
+    return 0
+  fi
+
+  ensure_dirs
+  deadline=$(($(now_epoch) + USQUE_SUPERVISE_RECOVERY_GRACE))
+  printf '%s\n' "$deadline" >"$SUPERVISE_RECOVERY_MARKER"
+}
+
+recovery_grace_remaining() {
+  if ! is_uint "$USQUE_SUPERVISE_RECOVERY_GRACE" ||
+    [ "$USQUE_SUPERVISE_RECOVERY_GRACE" -le 0 ]; then
+    rm -f "$SUPERVISE_RECOVERY_MARKER"
+    echo 0
+    return 0
+  fi
+
+  if [ ! -f "$SUPERVISE_RECOVERY_MARKER" ]; then
+    echo 0
+    return 0
+  fi
+
+  deadline=$(sed -n '1p' "$SUPERVISE_RECOVERY_MARKER" 2>/dev/null || true)
+  if ! is_uint "$deadline"; then
+    rm -f "$SUPERVISE_RECOVERY_MARKER"
+    echo 0
+    return 0
+  fi
+
+  now=$(now_epoch)
+  if [ "$deadline" -le "$now" ]; then
+    rm -f "$SUPERVISE_RECOVERY_MARKER"
+    echo 0
+    return 0
+  fi
+
+  echo $((deadline - now))
+}
+
+start_public_relay() {
+  require_cmd "$PYTHON_BIN"
+
+  "$PYTHON_BIN" - warp-masque-socks-relay "$USQUE_BIND" "$USQUE_PORT" "$USQUE_BACKEND_BIND" "$USQUE_BACKEND_PORT" <<'PY' &
+import socket
+import sys
+import threading
+
+_, _, bind, port, backend_bind, backend_port = sys.argv
+port = int(port)
+backend_port = int(backend_port)
+
+
+def close_socket(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        close_socket(src)
+        close_socket(dst)
+
+
+def handle_client(client):
+    try:
+        backend = socket.create_connection((backend_bind, backend_port), timeout=3)
+    except OSError:
+        close_socket(client)
+        return
+
+    threading.Thread(target=pump, args=(client, backend), daemon=True).start()
+    threading.Thread(target=pump, args=(backend, client), daemon=True).start()
+
+
+family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+server = socket.socket(family, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((bind, port))
+server.listen(128)
+print(
+    f"public SOCKS relay listening on {bind}:{port} -> {backend_bind}:{backend_port}",
+    file=sys.stderr,
+    flush=True,
+)
+
+while True:
+    client, _ = server.accept()
+    threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+PY
+}
+
 supervise_proxy() {
   setup
   require_runtime_config
 
   child_pid=
+  relay_pid=
+  child_stderr_fifo=
+  child_stderr_monitor_pid=
+  supervisor_pid=$$
+  initial_network_signature=$(network_signature || true)
+
   cleanup_child() {
+    if [ -n "${relay_pid:-}" ] && kill -0 "$relay_pid" >/dev/null 2>&1; then
+      kill "$relay_pid" >/dev/null 2>&1 || true
+      wait "$relay_pid" >/dev/null 2>&1 || true
+    fi
+
     if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" >/dev/null 2>&1; then
       kill "$child_pid" >/dev/null 2>&1 || true
+      (
+        sleep "$USQUE_SUPERVISE_CHILD_STOP_TIMEOUT"
+        if kill -0 "$child_pid" >/dev/null 2>&1; then
+          kill -9 "$child_pid" >/dev/null 2>&1 || true
+        fi
+      ) &
+      child_stop_timer_pid=$!
       wait "$child_pid" >/dev/null 2>&1 || true
+      kill "$child_stop_timer_pid" >/dev/null 2>&1 || true
+      wait "$child_stop_timer_pid" >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${child_stderr_monitor_pid:-}" ]; then
+      kill "$child_stderr_monitor_pid" >/dev/null 2>&1 || true
+      wait "$child_stderr_monitor_pid" >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${child_stderr_fifo:-}" ]; then
+      rm -f "$child_stderr_fifo"
     fi
   }
+
+  exit_for_network_change() {
+    current_network_signature=$(network_signature || true)
+    if [ "$current_network_signature" != "$initial_network_signature" ]; then
+      echo 'default network changed; exiting for launchd restart' >&2
+      mark_recovery_grace
+      cleanup_child
+      exit 1
+    fi
+  }
+
+  sleep_with_network_monitor() {
+    remaining=$1
+    poll_interval=$USQUE_SUPERVISE_NETWORK_POLL_INTERVAL
+
+    while [ "$remaining" -gt 0 ]; do
+      if [ "$poll_interval" -le 0 ] || [ "$poll_interval" -gt "$remaining" ]; then
+        sleep_for=$remaining
+      else
+        sleep_for=$poll_interval
+      fi
+
+      sleep "$sleep_for"
+      remaining=$((remaining - sleep_for))
+      exit_for_network_change
+    done
+  }
+
+  monitor_child_stderr() {
+    while IFS= read -r line; do
+      printf '%s\n' "$line" >&2
+      case "$line" in
+        *'Tunnel connection lost:'*)
+          echo 'usque tunnel connection lost; exiting for launchd restart' >&2
+          mark_recovery_grace
+          kill -USR1 "$supervisor_pid" >/dev/null 2>&1 || true
+          ;;
+      esac
+    done <"$child_stderr_fifo"
+  }
+
   trap 'cleanup_child; exit 0' INT TERM HUP
+  trap 'cleanup_child; exit 1' USR1
+
+  recovery_grace=$(recovery_grace_remaining)
+  gated_proxy=0
+  child_bind=$USQUE_BIND
+  child_port=$USQUE_PORT
+  if [ "$recovery_grace" -gt 0 ]; then
+    printf 'recent network recovery detected; starting hidden backend before public SOCKS relay\n' >&2
+    gated_proxy=1
+    child_bind=$USQUE_BACKEND_BIND
+    child_port=$USQUE_BACKEND_PORT
+  fi
+
+  child_stderr_fifo="$LOCAL_DIR/supervise-stderr.$$"
+  rm -f "$child_stderr_fifo"
+  mkfifo "$child_stderr_fifo"
+  monitor_child_stderr &
+  child_stderr_monitor_pid=$!
 
   "$USQUE_BIN" \
     -c "$USQUE_RUNTIME_CONFIG" \
     socks \
-    -b "$USQUE_BIND" \
-    -p "$USQUE_PORT" \
+    -b "$child_bind" \
+    -p "$child_port" \
     -P "$USQUE_CONNECT_PORT" \
     -d 1.1.1.1 \
-    -d 1.0.0.1 &
+    -d 1.0.0.1 2>"$child_stderr_fifo" &
   child_pid=$!
 
+  if [ "$gated_proxy" -eq 1 ]; then
+    recovery_deadline=$(($(now_epoch) + recovery_grace))
+    backend_ready=0
+    while kill -0 "$child_pid" >/dev/null 2>&1; do
+      exit_for_network_change
+      if backend_listener_up &&
+        proxy_trace_check "$USQUE_BACKEND_BIND" "$USQUE_BACKEND_PORT" "$USQUE_SUPERVISE_HEALTH_TIMEOUT"; then
+        backend_ready=1
+        break
+      fi
+      if [ "$(now_epoch)" -ge "$recovery_deadline" ]; then
+        echo 'hidden backend did not become healthy before recovery deadline; exiting for launchd restart' >&2
+        mark_recovery_grace
+        cleanup_child
+        exit 1
+      fi
+      sleep_with_network_monitor 1
+    done
+
+    if [ "$backend_ready" -ne 1 ]; then
+      wait "$child_pid"
+      child_status=$?
+      cleanup_child
+      return "$child_status"
+    fi
+
+    rm -f "$SUPERVISE_RECOVERY_MARKER"
+    start_public_relay
+    relay_pid=$!
+
+    attempts=0
+    while [ "$attempts" -lt 5 ]; do
+      if listener_up; then
+        break
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+
+    if ! listener_up; then
+      echo 'failed to start public SOCKS relay' >&2
+      mark_recovery_grace
+      cleanup_child
+      exit 1
+    fi
+  fi
+
   if [ "$USQUE_SUPERVISE_HEALTH_GRACE" -gt 0 ]; then
-    sleep "$USQUE_SUPERVISE_HEALTH_GRACE"
+    sleep_with_network_monitor "$USQUE_SUPERVISE_HEALTH_GRACE"
   fi
 
   failures=0
+  sleep_interval=$USQUE_SUPERVISE_HEALTH_INTERVAL
   while kill -0 "$child_pid" >/dev/null 2>&1; do
-    if listener_up &&
-      curl -k --socks5 "$USQUE_BIND:$USQUE_PORT" -4 --connect-timeout "$USQUE_SUPERVISE_HEALTH_TIMEOUT" -s "$USQUE_TRACE_URL" >/dev/null 2>&1; then
+    exit_for_network_change
+
+    if listener_up && proxy_trace_check "$USQUE_BIND" "$USQUE_PORT" "$USQUE_SUPERVISE_HEALTH_TIMEOUT"; then
       failures=0
+      sleep_interval=$USQUE_SUPERVISE_HEALTH_INTERVAL
     else
       failures=$((failures + 1))
       printf 'proxy health check failed (%s/%s)\n' "$failures" "$USQUE_SUPERVISE_HEALTH_FAILURES" >&2
       if [ "$failures" -ge "$USQUE_SUPERVISE_HEALTH_FAILURES" ]; then
         echo 'proxy health check failure threshold reached; exiting for launchd restart' >&2
+        mark_recovery_grace
         cleanup_child
         exit 1
       fi
+      sleep_interval=$USQUE_SUPERVISE_HEALTH_RETRY_INTERVAL
     fi
-    sleep "$USQUE_SUPERVISE_HEALTH_INTERVAL"
+    sleep_with_network_monitor "$sleep_interval"
   done
 
   wait "$child_pid"
+  child_status=$?
+  cleanup_child
+  return "$child_status"
 }
 
 run_proxy() {

@@ -79,7 +79,43 @@ cat >"$FAKEBIN/nc" <<'EOF'
 #!/bin/sh
 set -eu
 
-[ -f "${TEST_STATE_DIR:?}/listener" ]
+port=${3:-}
+if [ "$port" = "${USQUE_BACKEND_PORT:-1081}" ]; then
+  [ -f "${TEST_STATE_DIR:?}/backend-listener" ]
+else
+  [ -f "${TEST_STATE_DIR:?}/listener" ]
+fi
+EOF
+
+cat >"$FAKEBIN/python3" <<'EOF'
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" != "-" ] || [ "${2:-}" != "warp-masque-socks-relay" ]; then
+  echo "unexpected python3 command: $*" >&2
+  exit 1
+fi
+
+touch "${TEST_STATE_DIR:?}/listener" "${TEST_STATE_DIR:?}/relay-running"
+printf '%s\n' "$$" >"${TEST_STATE_DIR:?}/relay-pid"
+trap 'rm -f "${TEST_STATE_DIR:?}/listener" "${TEST_STATE_DIR:?}/relay-running"; exit 0' INT TERM HUP EXIT
+
+while :; do
+  sleep 1
+done
+EOF
+
+cat >"$FAKEBIN/route" <<'EOF'
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 3 ] && [ "$1" = "-n" ] && [ "$2" = "get" ] && [ "$3" = "default" ]; then
+  cat "${TEST_STATE_DIR:?}/default-route"
+  exit 0
+fi
+
+echo "unexpected route command: $*" >&2
+exit 1
 EOF
 
 cat >"$FAKEBIN/curl" <<'EOF'
@@ -89,15 +125,21 @@ set -eu
 state_dir=${TEST_STATE_DIR:?}
 url=
 data=
+max_time=
+socks_addr=
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --socks5)
+    --socks5|--socks5-hostname)
+      socks_addr=${2:-}
       shift 2
       ;;
-    --connect-timeout|-X|-H|-o|-w|--data|--data-raw|--data-binary|-d)
+    --connect-timeout|-X|-H|-o|-w|--data|--data-raw|--data-binary|-d|--max-time|-m)
       if [ "$1" = "--data" ] || [ "$1" = "--data-raw" ] || [ "$1" = "--data-binary" ] || [ "$1" = "-d" ]; then
         data=${2:-}
+      fi
+      if [ "$1" = "--max-time" ] || [ "$1" = "-m" ]; then
+        max_time=${2:-}
       fi
       shift 2
       ;;
@@ -116,11 +158,30 @@ done
 
 case "$url" in
   https://1.1.1.1/cdn-cgi/trace)
-    if [ ! -f "$state_dir/listener" ]; then
+    backend_port=${USQUE_BACKEND_PORT:-1081}
+    if [ "$socks_addr" = "127.0.0.1:$backend_port" ]; then
+      required_listener="$state_dir/backend-listener"
+      failure_flag="$state_dir/backend-health-fail"
+    else
+      required_listener="$state_dir/listener"
+      failure_flag="$state_dir/trace-http-fail"
+    fi
+
+    if [ ! -f "$required_listener" ]; then
       exit 7
     fi
 
-    if [ -f "$state_dir/trace-http-fail" ]; then
+    if [ -f "$state_dir/trace-hang" ]; then
+      if [ -z "$max_time" ]; then
+        touch "$state_dir/curl-hung"
+        while [ -f "$state_dir/trace-hang" ]; do
+          sleep 1
+        done
+      fi
+      exit 28
+    fi
+
+    if [ -f "$failure_flag" ]; then
       exit 28
     fi
 
@@ -234,7 +295,7 @@ JSON
 esac
 EOF
 
-chmod 755 "$FAKEBIN/launchctl" "$FAKEBIN/nc" "$FAKEBIN/curl" "$TEST_LOCAL_DIR/usque"
+chmod 755 "$FAKEBIN/launchctl" "$FAKEBIN/nc" "$FAKEBIN/python3" "$FAKEBIN/route" "$FAKEBIN/curl" "$TEST_LOCAL_DIR/usque"
 
 export HOME="$TEST_HOME"
 export PATH="$FAKEBIN:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -303,6 +364,17 @@ printf '%s\n' "$status_output" | grep -q 'listener: up (127.0.0.1:1080)'
 trace_output=$("$SCRIPT" trace)
 printf '%s\n' "$trace_output" | grep -q '^warp=on$'
 printf '%s\n' "$trace_output" | grep -q '^loc=US$'
+
+touch "$TEST_STATE_DIR/trace-http-fail"
+if ! "$SCRIPT" restart; then
+  echo "restart failed while the proxy egress health check was failing" >&2
+  exit 1
+fi
+
+status_output=$("$SCRIPT" status)
+printf '%s\n' "$status_output" | grep -q 'launchd: loaded'
+printf '%s\n' "$status_output" | grep -q 'listener: up (127.0.0.1:1080)'
+rm -f "$TEST_STATE_DIR/trace-http-fail"
 
 "$SCRIPT" export-config "$EXPORT_CONFIG"
 
@@ -866,11 +938,36 @@ while [ "$#" -gt 0 ]; do
 done
 
 cmd=${1:-}
+shift || true
 
 case "$cmd" in
   socks)
+    port=1080
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -p)
+          port=$2
+          shift 2
+          ;;
+        -b|-P|-d|-t|-k|-m|-s|-u|-w)
+          shift 2
+          ;;
+        -6|-l|-F|-S)
+          shift
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
     touch "${TEST_STATE_DIR:?}/usque-socks-running"
-    trap 'rm -f "${TEST_STATE_DIR:?}/usque-socks-running"; exit 0' INT TERM EXIT
+    printf '%s\n' "$port" >>"${TEST_STATE_DIR:?}/usque-socks-ports"
+    if [ "$port" = "${USQUE_BACKEND_PORT:-1081}" ]; then
+      touch "${TEST_STATE_DIR:?}/backend-listener"
+    else
+      touch "${TEST_STATE_DIR:?}/listener"
+    fi
+    trap 'rm -f "${TEST_STATE_DIR:?}/usque-socks-running" "${TEST_STATE_DIR:?}/backend-listener"; exit 0' INT TERM EXIT
     while :; do
       sleep 1
     done
@@ -881,7 +978,10 @@ esac
 EOF
 chmod 755 "$TEST_LOCAL_DIR/usque"
 touch "$TEST_STATE_DIR/listener"
-rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running"
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/backend-health-fail" \
+  "$TEST_STATE_DIR/usque-socks-running" "$TEST_STATE_DIR/backend-listener" \
+  "$TEST_STATE_DIR/relay-running" "$TEST_STATE_DIR/usque-socks-ports" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
 
 USQUE_SUPERVISE_HEALTH_INTERVAL=1 \
 USQUE_SUPERVISE_HEALTH_FAILURES=2 \
@@ -926,6 +1026,451 @@ fi
 
 if wait "$supervisor_pid"; then
   echo "supervise exited zero after repeated health check failures" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener" "$TEST_STATE_DIR/trace-http-fail"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=60 \
+USQUE_SUPERVISE_HEALTH_RETRY_INTERVAL=1 \
+USQUE_SUPERVISE_HEALTH_FAILURES=2 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 6 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise waited for the full health interval before retrying failures" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after quick health retries failed" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener" "$TEST_STATE_DIR/trace-http-fail"
+
+"$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 9 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "default supervisor settings killed the child during startup settling" >&2
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+attempts=0
+while [ "$attempts" -lt 15 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "default supervisor settings never restarted persistently failed egress" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after default health failures" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_STATE_DIR/curl-hung" "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener" "$TEST_STATE_DIR/trace-hang"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=1 \
+USQUE_SUPERVISE_HEALTH_FAILURES=2 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive when the trace probe hung" >&2
+  rm -f "$TEST_STATE_DIR/trace-hang"
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-hang"
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after hung health checks" >&2
+  exit 1
+fi
+
+if [ -f "$TEST_STATE_DIR/curl-hung" ]; then
+  echo "trace probe was invoked without a total timeout" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/trace-hang" \
+  "$TEST_STATE_DIR/curl-hung" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener"
+cat >"$TEST_STATE_DIR/default-route" <<'EOF'
+gateway: 192.0.2.1
+interface: en0
+EOF
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=60 \
+USQUE_SUPERVISE_HEALTH_FAILURES=3 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+USQUE_SUPERVISE_NETWORK_POLL_INTERVAL=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  if [ -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if [ ! -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+  echo "supervise did not start child for network-change test" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+cat >"$TEST_STATE_DIR/default-route" <<'EOF'
+gateway: 198.51.100.1
+interface: en1
+EOF
+
+attempts=0
+while [ "$attempts" -lt 6 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive after default network changed" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after default network changed" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener"
+cat >"$TEST_STATE_DIR/default-route" <<'EOF'
+gateway: 192.0.2.1
+interface: en0
+EOF
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=60 \
+USQUE_SUPERVISE_HEALTH_FAILURES=3 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+USQUE_SUPERVISE_NETWORK_POLL_INTERVAL=1 \
+USQUE_SUPERVISE_RECOVERY_GRACE=8 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  if [ -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if [ ! -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+  echo "supervise did not start child for recovery-grace marker test" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+cat >"$TEST_STATE_DIR/default-route" <<'EOF'
+gateway: 198.51.100.1
+interface: en1
+EOF
+
+attempts=0
+while [ "$attempts" -lt 6 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive after default network changed in recovery-grace marker test" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after default network changed in recovery-grace marker test" >&2
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/usque-socks-running" "$TEST_STATE_DIR/backend-listener" \
+  "$TEST_STATE_DIR/relay-running" "$TEST_STATE_DIR/listener" "$TEST_STATE_DIR/usque-socks-ports"
+touch "$TEST_STATE_DIR/backend-health-fail"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=1 \
+USQUE_SUPERVISE_HEALTH_FAILURES=1 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+USQUE_BACKEND_PORT=1081 \
+USQUE_SUPERVISE_RECOVERY_GRACE=4 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+sleep 2
+
+if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise exited while waiting for hidden backend health" >&2
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ ! -f "$TEST_STATE_DIR/usque-socks-running" ]; then
+  echo "supervise did not start the hidden backend during recovery" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if [ -f "$TEST_STATE_DIR/listener" ] || [ -f "$TEST_STATE_DIR/relay-running" ]; then
+  echo "supervise exposed the public SOCKS listener before backend health passed" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+rm -f "$TEST_STATE_DIR/backend-health-fail"
+
+attempts=0
+while [ "$attempts" -lt 8 ]; do
+  if [ -f "$TEST_STATE_DIR/listener" ] && [ -f "$TEST_STATE_DIR/relay-running" ]; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if [ ! -f "$TEST_STATE_DIR/listener" ] || [ ! -f "$TEST_STATE_DIR/relay-running" ]; then
+  echo "supervise did not expose the public SOCKS listener after backend health passed" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+touch "$TEST_STATE_DIR/trace-http-fail"
+
+attempts=0
+while [ "$attempts" -lt 8 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise never enforced health failures after recovery grace expired" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after recovery grace expired" >&2
+  exit 1
+fi
+
+cat >"$TEST_LOCAL_DIR/usque" <<'EOF'
+#!/bin/sh
+set -eu
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -c)
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  socks)
+    touch "${TEST_STATE_DIR:?}/usque-socks-running"
+    printf '2026/05/19 13:44:00 Connected to MASQUE server\n' >&2
+    sleep 1
+    printf '2026/05/19 13:44:01 Tunnel connection lost: connection closed while reading from IP connection: use of closed network connection. Reconnecting...\n' >&2
+    while :; do
+      sleep 1
+    done
+    ;;
+  *)
+    ;;
+esac
+EOF
+chmod 755 "$TEST_LOCAL_DIR/usque"
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=60 \
+USQUE_SUPERVISE_HEALTH_GRACE=10 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 6 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive after usque reported tunnel loss" >&2
+  kill "$supervisor_pid" >/dev/null 2>&1 || true
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after usque reported tunnel loss" >&2
+  exit 1
+fi
+
+cat >"$TEST_LOCAL_DIR/usque" <<'EOF'
+#!/bin/sh
+set -eu
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -c)
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  socks)
+    touch "${TEST_STATE_DIR:?}/usque-socks-running"
+    printf '%s\n' "$$" >"${TEST_STATE_DIR:?}/usque-socks-pid"
+    trap '' INT TERM HUP
+    while :; do
+      sleep 1
+    done
+    ;;
+  *)
+    ;;
+esac
+EOF
+chmod 755 "$TEST_LOCAL_DIR/usque"
+rm -f "$TEST_STATE_DIR/trace-http-fail" "$TEST_STATE_DIR/usque-socks-running" \
+  "$TEST_STATE_DIR/usque-socks-pid" "$TEST_LOCAL_DIR/supervise-recovery-until"
+touch "$TEST_STATE_DIR/listener" "$TEST_STATE_DIR/trace-http-fail"
+
+USQUE_SUPERVISE_HEALTH_INTERVAL=1 \
+USQUE_SUPERVISE_HEALTH_FAILURES=1 \
+USQUE_SUPERVISE_HEALTH_GRACE=0 \
+USQUE_SUPERVISE_HEALTH_TIMEOUT=1 \
+USQUE_SUPERVISE_RECOVERY_GRACE=0 \
+USQUE_SUPERVISE_CHILD_STOP_TIMEOUT=1 \
+  "$SCRIPT" supervise >/dev/null 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ "$attempts" -lt 5 ]; do
+  if ! kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  attempts=$((attempts + 1))
+done
+
+if kill -0 "$supervisor_pid" >/dev/null 2>&1; then
+  echo "supervise stayed alive while waiting for a TERM-ignoring child" >&2
+  child_pid=$(cat "$TEST_STATE_DIR/usque-socks-pid" 2>/dev/null || true)
+  kill -9 "$supervisor_pid" >/dev/null 2>&1 || true
+  if [ -n "$child_pid" ]; then
+    kill -9 "$child_pid" >/dev/null 2>&1 || true
+  fi
+  wait "$supervisor_pid" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+if wait "$supervisor_pid"; then
+  echo "supervise exited zero after killing a TERM-ignoring child" >&2
+  exit 1
+fi
+
+child_pid=$(cat "$TEST_STATE_DIR/usque-socks-pid" 2>/dev/null || true)
+if [ -n "$child_pid" ] && kill -0 "$child_pid" >/dev/null 2>&1; then
+  echo "supervise left a TERM-ignoring child running" >&2
+  kill -9 "$child_pid" >/dev/null 2>&1 || true
   exit 1
 fi
 
